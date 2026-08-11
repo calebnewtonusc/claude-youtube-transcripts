@@ -98,6 +98,30 @@ transcript_engine: "mlx-whisper-small.en"
 `transcript_engine` matters: whisper and caption text read differently, and a mixed corpus
 should stay auditable.
 
+## Building a corpus
+
+"Build a corpus of this channel" is almost never a request for a folder of files. It is a
+request to **know** what is in the channel. The skill teaches Claude to run the whole arc
+without being told: size it first and report back, fetch it, read all of it, then distill it
+into durable notes rather than a chat reply that disappears.
+
+That means the working prompt is short:
+
+```
+Build a corpus of https://www.youtube.com/@somechannel, read all of it,
+and distill it into my notes. I care about X.
+```
+
+The conventions it follows so you do not have to specify them: standard repo layout
+(`transcripts/`, `data/`, `scripts/`), private repo by default when the material is a living
+creator's teaching, failures recorded in the manifest instead of crashing the run, notes
+written incrementally so a long read survives a context compaction, and the distillation split
+by concern (framework, practices, stories, how it applies to you) rather than by video.
+
+It also reads whatever standing notes you keep about yourself before writing the "how this
+applies to you" part, and flags anything in the teaching that would be harmful applied to your
+actual situation. An accurate map of a limited teacher beats a flattering map of a great one.
+
 ## Options
 
 ```

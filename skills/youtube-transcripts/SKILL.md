@@ -121,10 +121,71 @@ concept mapping. Not good enough to publish verbatim without a human pass, since
 and domain jargon are where both slip. Say so when the output is heading toward a book,
 course, or anything quoted in public.
 
-## Corpus work
+## Building a corpus
 
-When building a corpus rather than reading one video, capture in frontmatter what future
-layers will need: `transcript_engine` (so mixed-engine corpora stay auditable), `upload_date`,
-`duration_seconds`, and `word_count`. Keep engines consistent across a corpus where possible;
-whisper and caption text read noticeably differently, and that difference will show up in
-anything trained or indexed on top.
+Fetching is the easy half. "Build a corpus of channel X" is almost never a request for a
+folder of files; it is a request to **know** what is in that channel. Run the whole arc
+without being asked to: size it, fetch it, read it, distill it.
+
+**Size it before committing.** `yt-bulk <url> --list` first, then report video count, total
+duration, and estimated word count, and say what that implies. Forty hours is roughly 400k
+words and is a genuine read. Three hundred videos is a different project and deserves a
+conversation about staged reading before an hour of downloads happens.
+
+**Standard layout**, so every corpus looks the same and tooling written for one works on the
+next:
+
+```
+<name>-corpus/
+  transcripts/YYYY-MM-DD-slug.md    one per video, frontmatter + timestamped paragraphs
+  data/videos.json                  every video found on the channel
+  data/manifest.json                what was actually fetched: engines, word counts, failures
+  scripts/                          the pipeline, resumable
+  README.md                         what this is, how to regenerate, accuracy caveat
+```
+
+Frontmatter carries what later layers need: `transcript_engine` (so mixed-engine corpora stay
+auditable), `upload_date`, `duration_seconds`, `word_count`. Keep engines consistent across a
+corpus where you can; whisper and caption text read noticeably differently and that difference
+surfaces in anything indexed or trained on top.
+
+**Record failures in the manifest rather than crashing the run.** One bad video should never
+cost the other eighty-nine.
+
+**Default to a private repo when the material is someone else's teaching.** A full transcript
+archive of a living creator's channel is their copyrighted work. Private is the right default
+for personal study, and the README should say plainly that it is not for redistribution. Ask
+before making one public, and if the user is working _with_ the creator, note that publishing
+is the creator's call and not the user's.
+
+**Then actually read it.** All of it, not the titles and not a sample. Read in batches and
+write distilled notes to a scratch file as you go, so a context compaction mid-read costs
+nothing. The goal is to know the material well enough to apply it later, not to produce a
+summary.
+
+While reading, work out and record, in the source's own vocabulary rather than translated into
+something more familiar:
+
+- who the person actually is, established from the corpus rather than assumed
+- the recurring framework and what they call it
+- the concrete practices, meaning anything they tell people to actually do
+- the stories, with enough detail to retell them accurately
+- where they sit on the questions that matter most for why the user is reading them
+- where they contradict or are in tension with the mainstream of their own tradition
+
+**Distill into durable notes, not a chat reply.** A corpus read that lives only in one
+conversation gets lost. If the user keeps a personal context or notes repo, write the
+distillation there as a small set of on-demand files, wire it into whatever index and memory
+system that repo uses, and commit. Split by concern rather than by video: the framework, the
+practices, the stories, and one file on how it applies to this specific user.
+
+**Read the user's own relevant notes before writing that application file**, and hold their
+stated positions. Someone reading a teacher on a subject they are personally living has
+already decided things about it, and the useful work is naming where the material confirms
+them, where it sharpens them, and where it should be left. Flag anything in the teaching that
+would be harmful applied to their actual situation. Resonance is not the goal; an accurate map
+of a limited teacher beats a flattering map of a great one.
+
+**Carry the accuracy caveat forward.** The distillation inherits it: machine transcripts are
+fine for study and retrieval and not fine for quoting to third parties without verification,
+because proper nouns and domain jargon are exactly where both engines slip.
