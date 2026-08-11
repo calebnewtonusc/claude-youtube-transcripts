@@ -1,0 +1,82 @@
+#!/usr/bin/env python3
+"""Print one video's transcript to stdout.
+
+    yt-transcript https://youtu.be/VIDEO_ID
+    yt-transcript VIDEO_ID --timestamps
+    yt-transcript <url> --json
+    yt-transcript <url> --whisper        # skip captions, transcribe locally
+
+Tries YouTube's captions first, falls back to local Whisper. Use --whisper
+directly when captions are blocked or disabled, or when you want punctuation.
+For a whole channel or playlist, use yt-bulk.
+"""
+import argparse
+import json
+import os
+import re
+import subprocess
+import sys
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+sys.path.insert(0, HERE)
+
+# Reuse the engines and formatting from yt-bulk so both agree exactly.
+# spec_from_file_location returns None for an extensionless file, so name the
+# loader explicitly rather than letting Python infer it from the suffix.
+import importlib.util
+from importlib.machinery import SourceFileLoader
+
+_loader = SourceFileLoader("ytbulk", os.path.join(HERE, "yt-bulk"))
+_spec = importlib.util.spec_from_loader("ytbulk", _loader)
+yb = importlib.util.module_from_spec(_spec)
+_loader.exec_module(yb)
+
+ID_RE = re.compile(r"(?:v=|/shorts/|/embed/|/live/|youtu\.be/|/v/)([A-Za-z0-9_-]{11})")
+
+
+def video_id(s):
+    if re.fullmatch(r"[A-Za-z0-9_-]{11}", s):
+        return s
+    m = ID_RE.search(s)
+    if not m:
+        sys.exit("Could not find a video ID in: %s" % s)
+    return m.group(1)
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("url")
+    ap.add_argument("--lang", default="en")
+    ap.add_argument("--model", default="small.en")
+    ap.add_argument("--timestamps", action="store_true")
+    ap.add_argument("--json", action="store_true")
+    ap.add_argument("--whisper", action="store_true",
+                    help="skip captions; download audio and transcribe locally")
+    a = ap.parse_args()
+
+    vid = video_id(a.url)
+    cues, engine = None, None
+    if not a.whisper:
+        cues = yb.via_captions(vid, a.lang)
+        engine = "youtube-captions" if cues else None
+    if not cues:
+        print("captions unavailable, transcribing locally ...", file=sys.stderr)
+        cues = yb.via_whisper(vid, a.model)
+        engine = "mlx-whisper-%s" % a.model
+    if not cues:
+        sys.exit("No transcript available for %s." % vid)
+
+    paras = yb.to_paragraphs(cues)
+    print("# %s  (%d segments via %s)" % (vid, len(cues), engine), file=sys.stderr)
+
+    if a.json:
+        print(json.dumps([{"start": s, "text": t} for s, t in paras], indent=2))
+    elif a.timestamps:
+        for s, t in paras:
+            print("[%s] %s" % (yb.stamp(s), t))
+    else:
+        print(" ".join(t for _, t in paras))
+
+
+if __name__ == "__main__":
+    main()

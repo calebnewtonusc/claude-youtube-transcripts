@@ -1,0 +1,323 @@
+#!/usr/bin/env python3
+"""Transcribe a whole YouTube channel or playlist into structured markdown.
+
+    yt-bulk https://www.youtube.com/@somechannel
+    yt-bulk https://www.youtube.com/playlist?list=PL... --out ./corpus
+    yt-bulk https://youtu.be/VIDEO_ID --engine whisper
+
+Two engines, and the choice matters more than it looks:
+
+  captions  Ask YouTube for its auto-captions. Fast (~2s/video) but YouTube
+            rate-limits this endpoint hard, and once it blocks your IP it stays
+            blocked for hours. No punctuation, no sentence casing.
+  whisper   Download the audio and transcribe locally. Slower to start but
+            immune to the caption block, works on videos with captions
+            disabled, and produces properly punctuated text.
+
+Default is `auto`: try captions, fall back to whisper per video.
+
+Resumable. Already-written files are skipped, so re-running after a failure or
+a rate limit costs nothing. Interrupt it whenever you like.
+"""
+import argparse
+import json
+import os
+import re
+import shutil
+import subprocess
+import sys
+import tempfile
+import time
+
+WORDS_PER_PARA = 55
+MLX_PY = os.path.expanduser("~/.local/share/yt-transcripts/mlx/bin/python")
+CAP_PY = os.path.expanduser("~/.local/share/yt-transcripts/captions/bin/python")
+
+
+# ----------------------------------------------------------------- utilities
+
+def stamp(sec):
+    sec = int(sec)
+    h, rem = divmod(sec, 3600)
+    m, s = divmod(rem, 60)
+    return "%d:%02d:%02d" % (h, m, s) if h else "%d:%02d" % (m, s)
+
+
+def slugify(title, maxlen=60):
+    s = re.sub(r"[^a-z0-9]+", "-", title.lower()).strip("-")
+    if len(s) > maxlen:
+        s = s[:maxlen].rsplit("-", 1)[0]
+    return s or "untitled"
+
+
+def run(cmd, timeout=900, env=None):
+    return subprocess.run(cmd, capture_output=True, text=True,
+                          timeout=timeout, env=env)
+
+
+# --------------------------------------------------------------- enumeration
+
+def enumerate_videos(url):
+    """Every video behind a channel, playlist, or single-video URL.
+
+    For a channel we union the /videos tab with its uploads playlist. They are
+    supposed to be identical and are not: on a real channel the tab was missing
+    two videos the playlist had.
+    """
+    sources = [url]
+    if re.search(r"youtube\.com/(@[\w.-]+|c/|channel/|user/)", url) and "/playlist" not in url:
+        base = url.rstrip("/")
+        for suffix in ("/videos", "/streams", "/podcasts"):
+            if not base.endswith(suffix):
+                sources.append(base + suffix)
+        sources = list(dict.fromkeys(sources))
+
+    merged, seen_playlists = {}, set()
+    for src in sources:
+        p = run(["yt-dlp", "--flat-playlist", "--dump-json",
+                 "--ignore-errors", src], timeout=900)
+        for line in p.stdout.splitlines():
+            try:
+                r = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            # A channel tab can hand back playlist pointers; follow them once.
+            if r.get("_type") == "url" and "playlist?list=" in (r.get("url") or ""):
+                seen_playlists.add(r["url"])
+                continue
+            vid = r.get("id")
+            if vid and len(vid) == 11:
+                merged.setdefault(vid, {
+                    "video_id": vid,
+                    "title": (r.get("title") or "").strip(),
+                    "duration_seconds": int(r.get("duration") or 0),
+                    "url": "https://www.youtube.com/watch?v=" + vid,
+                })
+
+    for pl in seen_playlists:
+        p = run(["yt-dlp", "--flat-playlist", "--dump-json", "--ignore-errors", pl],
+                timeout=900)
+        for line in p.stdout.splitlines():
+            try:
+                r = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            vid = r.get("id")
+            if vid and len(vid) == 11:
+                merged.setdefault(vid, {
+                    "video_id": vid,
+                    "title": (r.get("title") or "").strip(),
+                    "duration_seconds": int(r.get("duration") or 0),
+                    "url": "https://www.youtube.com/watch?v=" + vid,
+                })
+    return list(merged.values())
+
+
+def fetch_meta(vid):
+    p = run(["yt-dlp", "--skip-download", "--no-warnings",
+             "--print", "%(upload_date)s\t%(title)s\t%(duration)s\t%(view_count)s",
+             "https://www.youtube.com/watch?v=" + vid], timeout=180)
+    parts = (p.stdout or "").strip().split("\n")[-1].split("\t")
+    if len(parts) < 4:
+        return {}
+    d = parts[0]
+    return {
+        "upload_date": "%s-%s-%s" % (d[:4], d[4:6], d[6:8]) if len(d) == 8 else "",
+        "title": parts[1],
+        "duration_seconds": int(float(parts[2])) if parts[2] not in ("NA", "") else 0,
+        "view_count": int(parts[3]) if parts[3].isdigit() else 0,
+    }
+
+
+# ------------------------------------------------------------------- engines
+
+def via_captions(vid, lang="en"):
+    code = (
+        "import json,sys\n"
+        "from youtube_transcript_api import YouTubeTranscriptApi\n"
+        "r = YouTubeTranscriptApi().fetch(sys.argv[1], languages=[sys.argv[2]])\n"
+        "print(json.dumps([[d['start'], d['text']] for d in r.to_raw_data()]))\n"
+    )
+    py = CAP_PY if os.path.exists(CAP_PY) else sys.executable
+    p = run([py, "-c", code, vid, lang], timeout=180)
+    if p.returncode == 0 and p.stdout.strip():
+        return [(float(a), b) for a, b in json.loads(p.stdout)]
+    return None
+
+
+def via_whisper(vid, model):
+    """Download audio, transcribe locally. Immune to the caption block."""
+    tmp = tempfile.mkdtemp(prefix="ytb-")
+    try:
+        audio = os.path.join(tmp, "a.mp3")
+        r = run(["yt-dlp", "-f", "bestaudio", "--extract-audio",
+                 "--audio-format", "mp3", "--audio-quality", "9",
+                 "--no-warnings", "--no-progress",
+                 "-o", os.path.join(tmp, "a.%(ext)s"),
+                 "https://www.youtube.com/watch?v=" + vid], timeout=1800)
+        if not os.path.exists(audio):
+            raise RuntimeError("audio download failed: %s" % r.stderr.strip()[-120:])
+
+        code = (
+            "import json,sys,mlx_whisper\n"
+            "r = mlx_whisper.transcribe(sys.argv[1], path_or_hf_repo=sys.argv[2])\n"
+            "print(json.dumps([[s['start'], s['text'].strip()] for s in r['segments']]))\n"
+        )
+        # An expired token in ~/.cache/huggingface/token gets picked up
+        # implicitly and turns an anonymous model download into a failed
+        # authenticated one. Ignore it rather than deleting the user's file.
+        env = dict(os.environ, HF_HUB_DISABLE_IMPLICIT_TOKEN="1", HF_TOKEN="")
+        p = run([MLX_PY, "-c", code, audio,
+                 "mlx-community/whisper-%s-mlx" % model], timeout=7200, env=env)
+        if p.returncode != 0:
+            raise RuntimeError("whisper failed: %s" % p.stderr.strip()[-160:])
+        return [(float(a), b) for a, b in
+                json.loads(p.stdout.strip().split("\n")[-1])]
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+# -------------------------------------------------------------------- output
+
+def to_paragraphs(cues):
+    """Merge raw cues into readable timestamped paragraphs.
+
+    Caption cues are 3-second fragments; 2,000 of them per talk is unreadable
+    and useless for retrieval. Merge until a speaker turn or a word budget,
+    keeping the first cue's timestamp so any sentence stays traceable.
+    """
+    paras, buf, start, words = [], [], None, 0
+    for t, raw in cues:
+        text = re.sub(r"\s+", " ", re.sub(r"^>>\s*", "", raw.replace("\n", " "))).strip()
+        turn = raw.strip().startswith(">>")
+        if not text:
+            continue
+        if buf and (turn or words >= WORDS_PER_PARA):
+            paras.append((start, " ".join(buf)))
+            buf, words, start = [], 0, None
+        if start is None:
+            start = t
+        buf.append(text)
+        words += len(text.split())
+    if buf:
+        paras.append((start, " ".join(buf)))
+    return paras
+
+
+def write_md(outdir, v, meta, cues, engine):
+    title = meta.get("title") or v["title"]
+    date = meta.get("upload_date") or "0000-00-00"
+    dur = meta.get("duration_seconds") or v["duration_seconds"]
+    paras = to_paragraphs(cues)
+    wc = sum(len(t.split()) for _, t in paras)
+
+    fm = [
+        ("title", json.dumps(title)), ("video_id", json.dumps(v["video_id"])),
+        ("url", json.dumps(v["url"])), ("upload_date", json.dumps(date)),
+        ("duration", json.dumps(stamp(dur))), ("duration_seconds", dur),
+        ("view_count", meta.get("view_count", 0)), ("word_count", wc),
+        ("segment_count", len(cues)), ("paragraph_count", len(paras)),
+        ("transcript_engine", json.dumps(engine)),
+    ]
+    body = "\n\n".join("**[%s]** %s" % (stamp(s), t) for s, t in paras)
+    md = ("---\n%s\n---\n\n# %s\n\n[Watch on YouTube](%s) · %s · %s · ~%s words\n\n"
+          "## Transcript\n\n%s\n") % (
+        "\n".join("%s: %s" % (k, x) for k, x in fm), title, v["url"],
+        stamp(dur), date, "{:,}".format(wc), body)
+
+    fn = "%s-%s.md" % (date, slugify(title))
+    open(os.path.join(outdir, fn), "w", encoding="utf-8").write(md)
+    return fn, wc
+
+
+def scan_disk(outdir):
+    """What we already have, read from the files themselves.
+
+    Deliberately not a manifest: a manifest written at the end of a run is lost
+    the moment the run is interrupted, and then everything re-downloads.
+    """
+    have = set()
+    for fn in os.listdir(outdir) if os.path.isdir(outdir) else []:
+        if not fn.endswith(".md"):
+            continue
+        with open(os.path.join(outdir, fn), encoding="utf-8") as fh:
+            for line in fh.read(2000).splitlines():
+                if line.startswith("video_id:"):
+                    have.add(line.split('"')[1])
+                    break
+    return have
+
+
+# ---------------------------------------------------------------------- main
+
+def main():
+    ap = argparse.ArgumentParser(
+        description="Transcribe a YouTube channel, playlist, or video to markdown.")
+    ap.add_argument("url")
+    ap.add_argument("--out", default="./transcripts")
+    ap.add_argument("--engine", choices=["auto", "captions", "whisper"], default="auto")
+    ap.add_argument("--model", default="small.en",
+                    help="whisper model: tiny.en, base.en, small.en, medium, large-v3")
+    ap.add_argument("--lang", default="en")
+    ap.add_argument("--limit", type=int)
+    ap.add_argument("--list", action="store_true", help="enumerate and exit")
+    a = ap.parse_args()
+
+    os.makedirs(a.out, exist_ok=True)
+    print("enumerating %s ..." % a.url, file=sys.stderr, flush=True)
+    videos = enumerate_videos(a.url)
+    if not videos:
+        sys.exit("No videos found. Check the URL.")
+    videos.sort(key=lambda v: -v["duration_seconds"])
+
+    total_h = sum(v["duration_seconds"] for v in videos) / 3600
+    print("found %d videos, %.1f hours" % (len(videos), total_h), file=sys.stderr)
+    if a.list:
+        for v in videos:
+            print("%s  %5.1f min  %s" % (v["video_id"],
+                                         v["duration_seconds"] / 60, v["title"][:60]))
+        return
+
+    have = scan_disk(a.out)
+    todo = [v for v in videos if v["video_id"] not in have]
+    if a.limit:
+        todo = todo[:a.limit]
+    print("%d already on disk, %d to fetch\n" % (len(have), len(todo)),
+          file=sys.stderr, flush=True)
+
+    ok, failed, t0 = 0, [], time.time()
+    for i, v in enumerate(todo, 1):
+        vid = v["video_id"]
+        cues, engine = None, None
+        try:
+            if a.engine in ("auto", "captions"):
+                cues = via_captions(vid, a.lang)
+                engine = "youtube-captions" if cues else None
+                # Serial on purpose. Parallel caption requests get the IP
+                # blocked for hours; 8 workers did exactly that once.
+                time.sleep(1)
+            if not cues and a.engine in ("auto", "whisper"):
+                cues = via_whisper(vid, a.model)
+                engine = "mlx-whisper-%s" % a.model
+            if not cues:
+                raise RuntimeError("no transcript from any engine")
+
+            meta = fetch_meta(vid)
+            fn, wc = write_md(a.out, v, meta, cues, engine)
+            ok += 1
+            print("[%3d/%d] ok %-22s %6d words  %s"
+                  % (i, len(todo), engine, wc, v["title"][:42]), flush=True)
+        except Exception as e:
+            failed.append((vid, str(e)[:110]))
+            print("[%3d/%d] FAIL %s (%s)"
+                  % (i, len(todo), v["title"][:40], str(e)[:70]), flush=True)
+
+    print("\n%d ok, %d failed, %.1f min" % (ok, len(failed), (time.time() - t0) / 60))
+    if failed:
+        print("re-run the same command to retry these:")
+        for vid, err in failed:
+            print("  ", vid, err)
+
+
+if __name__ == "__main__":
+    main()
