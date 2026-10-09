@@ -43,6 +43,15 @@ def video_id(s):
     return m.group(1)
 
 
+def normalize_argv(argv):
+    """A video id can start with "-" (e.g. -pHnkusDkmk), and argparse reads a
+    bare one as an unknown flag. Every option here is a double-dash word, so a
+    single-dash 11-character token is always an id: pass it as a URL instead.
+    Found 2026-10-09 when one of 134 videos in a creator ingest failed this way."""
+    return ["https://youtu.be/" + a if re.fullmatch(r"-[A-Za-z0-9_-]{10}", a) else a
+            for a in argv]
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("url")
@@ -52,7 +61,7 @@ def main():
     ap.add_argument("--json", action="store_true")
     ap.add_argument("--whisper", action="store_true",
                     help="skip captions; download audio and transcribe locally")
-    a = ap.parse_args()
+    a = ap.parse_args(normalize_argv(sys.argv[1:]))
 
     vid = video_id(a.url)
     cues, engine = None, None

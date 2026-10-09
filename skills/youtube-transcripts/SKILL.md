@@ -68,6 +68,13 @@ do not help, because the limit is applied per IP, not per session. A different n
 `403 Forbidden`. This one decays in minutes rather than hours. Just re-run; the resume logic
 picks up only what is missing.
 
+**Never hand-roll `yt-dlp --write-auto-subs` for a corpus.** Under a 429 it prints an
+error, writes no `.vtt`, and a script that saves whatever text it found records a blank
+transcript with no failure anywhere. On 2026-10-09 a creator ingest saved ten empty
+transcripts this way before anyone looked. Use `yt-transcript` (or `yt-bulk`), give long
+videos a long timeout (300 s killed 22 of 134 mid-transcription), and count empty
+transcripts before reporting a number.
+
 **Enumerate a channel from more than one source.** The `/videos` tab and the channel's
 uploads playlist are supposed to match and do not. On a real 90-video channel the tab was
 missing two. `yt-bulk` unions them.
