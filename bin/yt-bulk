@@ -145,8 +145,34 @@ def via_captions(vid, lang="en"):
     return None
 
 
+# A whisper run on a 2.5 hour episode took ~10 minutes on 2026-10-09, and its
+# output was lost to a `| head -c 60000` in the caller. The rerun then got an
+# HTTP 403 on the audio download, so the transcript could not be had again
+# without a 40 minute throttled section download. Cache every result.
+CACHE_DIR = os.environ.get("YT_TRANSCRIPT_CACHE",
+                           os.path.expanduser("~/.cache/yt-transcripts"))
+
+
+def _cache_path(vid, model):
+    return os.path.join(CACHE_DIR, "%s.whisper-%s.json" % (vid, model))
+
+
 def via_whisper(vid, model):
-    """Download audio, transcribe locally. Immune to the caption block."""
+    """Download audio, transcribe locally. Immune to the caption block.
+    Results are cached per video and model, so a rerun costs nothing."""
+    cached = _cache_path(vid, model)
+    if os.path.exists(cached):
+        with open(cached) as f:
+            return [(float(a), b) for a, b in json.load(f)]
+    cues = _whisper_uncached(vid, model)
+    os.makedirs(CACHE_DIR, exist_ok=True)
+    with open(cached + ".tmp", "w") as f:
+        json.dump(cues, f)
+    os.replace(cached + ".tmp", cached)
+    return cues
+
+
+def _whisper_uncached(vid, model):
     tmp = tempfile.mkdtemp(prefix="ytb-")
     try:
         audio = os.path.join(tmp, "a.mp3")
